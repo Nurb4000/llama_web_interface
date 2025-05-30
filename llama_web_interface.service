@@ -1,0 +1,12 @@
+[Unit]
+Description=Llama Web Interface
+After=network.target
+
+[Service]
+User=root
+WorkingDirectory=/home/user/llama_web_interface
+ExecStart=/usr/bin/python3 /home/user/llama_web_interface/llama_web_interface.py
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
