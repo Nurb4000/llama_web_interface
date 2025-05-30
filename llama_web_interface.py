@@ -15,7 +15,7 @@ def get_current_model():
     return "Unknown"
 
 def get_all_models():
-    return [f for f in os.listdir(MODEL_PATH) if os.path.isfile(os.path.join(MODEL_PATH, f))]
+    return sorted([f for f in os.listdir(MODEL_PATH) if os.path.isfile(os.path.join(MODEL_PATH, f))], key=lambda x: x.lower())
 
 def update_service_file(model_name):
     with open(LLAMA_SERVER_SERVICE_FILE, 'r') as file:
