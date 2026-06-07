@@ -81,7 +81,7 @@ def update_service(config):
     if not model:
         return False, "No model selected"
 
-    base = f"/opt/llama.cpp/llama-server -m /opt/llama.cpp/Models/{model} --n-gpu-layers 200 --host 0.0.0.0 --port 8080 -c {context} -t {threads}"
+    base = f"/opt/llama.cpp/llama-server -m /opt/llama.cpp/Models/{model} --n-gpu-layers 200 --host 0.0.0.0 --tools all --port 8080 -c {context} -t {threads}"
     if use_rpc:
         base += f" --rpc {rpcEPS}"
 
