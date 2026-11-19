@@ -13,6 +13,16 @@ SERVICE_FILE = "/etc/systemd/system/llama.service"
 
 rpcEPS = "10.0.1.27:4000,10.0.1.76:4000,10.0.1.24:4000,10.0.1.206:4000"
 
+def has_flag_value(parts, flag, expected, default=False):
+    # absent flag -> keep the default; present with another value -> off
+    try:
+        idx = parts.index(flag)
+    except ValueError:
+        return default
+    if idx + 1 < len(parts) and not parts[idx + 1].startswith("-"):
+        return parts[idx + 1] == expected
+    return default
+
 def get_service_status():
     try:
         result = subprocess.run(["systemctl", "status", "llama.service", "--no-pager"], capture_output=True, text=True)
@@ -36,7 +46,14 @@ def get_current_config():
             "model": "",
             "threads": 6,
             "context": 60000,
-            "rpc": False
+            "gpu_layers": -1,
+            "rpc": False,
+            "multimodal": False,
+            "rpc_eps": "",
+            "disable_thinking": False,
+            "cache_type_k": True,
+            "cache_type_v": True,
+            "vulkan": False
         }
         # Extract model path
         model_path = None
@@ -58,8 +75,35 @@ def get_current_config():
             config["context"] = int(parts[c_idx+1])
         except:
             pass
-        # rpc?
-        config["rpc"] = "--rpc" in parts
+        # Extract gpu layers
+        try:
+            g_idx = parts.index("--n-gpu-layers")
+            config["gpu_layers"] = int(parts[g_idx+1])
+        except:
+            pass
+        # multimodal
+        if "--mmproj" in parts:
+            config["multimodal"] = True
+            mm_idx = parts.index("--mmproj")
+            if mm_idx + 1 < len(parts):
+                config["mmproj"] = os.path.basename(parts[mm_idx + 1])
+
+        # rpc and rpc endpoints
+        if "--rpc" in parts:
+            config["rpc"] = True
+            rpc_idx = parts.index("--rpc")
+            if rpc_idx + 1 < len(parts) and not parts[rpc_idx+1].startswith("-"):
+                config["rpc_eps"] = parts[rpc_idx+1]
+        # disable thinking
+        if "--reasoning" in parts:
+            r_idx = parts.index("--reasoning")
+            if r_idx + 1 < len(parts) and parts[r_idx+1] == "off":
+                config["disable_thinking"] = True
+        # kv cache quantization
+        config["cache_type_k"] = has_flag_value(parts, "--cache-type-k", "q8_0", True)
+        config["cache_type_v"] = has_flag_value(parts, "--cache-type-v", "q8_0", True)
+        # vulkan device
+        config["vulkan"] = has_flag_value(parts, "--device", "Vulkan1", False)
 
         return config
     except Exception as e:
@@ -72,18 +116,46 @@ def list_models():
             models.append(f.name)
     return sorted(models)
 
+def list_mmproj_files():
+    files = []
+    if os.path.isdir(MODEL_DIR):
+        for f in Path(MODEL_DIR).iterdir():
+            if f.is_file() and re.search(r'(?i)(mmproj|clip|vlp|\.gguf)', f.name):
+                files.append(f.name)
+    return sorted(files)
+
 def update_service(config):
     threads = config.get("threads", 6)
     context = config.get("context", 60000)
     model = config.get("model", "")
     use_rpc = config.get("rpc", False)
+    use_mm = config.get("multimodal", False)
+    mmproj = config.get("mmproj", "")
+    rpc_eps = config.get("rpc_eps", rpcEPS)
+
+    gpu_layers = config.get("gpu_layers", -1)
+    disable_thinking = config.get("disable_thinking", False)
+    cache_type_k = config.get("cache_type_k", True)
+    cache_type_v = config.get("cache_type_v", True)
+    vulkan = config.get("vulkan", False)
 
     if not model:
         return False, "No model selected"
 
-    base = f"/opt/llama.cpp/llama-server -m /opt/llama.cpp/Models/{model} --n-gpu-layers 200 --host 0.0.0.0 --tools all --port 8080 -c {context} -t {threads}"
+    base = f"/opt/llama.cpp/llama-server -m /opt/llama.cpp/Models/{model} --n-gpu-layers {gpu_layers} --host 0.0.0.0 --tools all --port 8080 -c {context} -t {threads} --temp 0.2  --top-p 1.0 --min-p 0.05 --repeat-penalty 1.05"
     if use_rpc:
-        base += f" --rpc {rpcEPS}"
+        base += f" --rpc {rpc_eps}"
+    if use_mm:
+        mmproj_name = mmproj or model
+        base += f" --mmproj /opt/llama.cpp/Models/{mmproj_name}"
+    if disable_thinking:
+        base += " --reasoning off"
+    if cache_type_k:
+        base += " --cache-type-k q8_0"
+    if cache_type_v:
+        base += " --cache-type-v q8_0"
+    if vulkan:
+        base += " --device Vulkan1"
 
     service_content = f"""[Unit]
 Description=llama Service
@@ -187,17 +259,65 @@ HTML = """
             <label for="context">Context Length (default 60000)</label>
             <input type="number" name="context" id="context" value="{{context}}" min="1024">
 
+            <label for="gpu_layers">GPU Layers (default -1, use all layers)</label>
+            <input type="number" name="gpu_layers" id="gpu_layers" value="{{gpu_layers}}" min="-1">
+
             <label>
                 <input type="checkbox" name="rpc" {{rpc_checked}}>
                 Enable rpc Mode
             </label>
 
-            <button type="submit">Update & Restart</button>
+            <label>
+                <input type="checkbox" name="multimodal" {{multimodal_checked}}>
+                Enable Multimodal Mode
+            </label>
+
+            <label>
+                <input type="checkbox" name="disable_thinking" {{disable_thinking_checked}}>
+                Disable Thinking (--reasoning off)
+            </label>
+
+            <label>
+                <input type="checkbox" name="cache_type_k" {{cache_type_k_checked}}>
+                q8_0 K Cache (--cache-type-k q8_0)
+            </label>
+
+            <label>
+                <input type="checkbox" name="cache_type_v" {{cache_type_v_checked}}>
+                q8_0 V Cache (--cache-type-v q8_0)
+            </label>
+
+            <label>
+                <input type="checkbox" name="vulkan" {{vulkan_checked}}>
+                Use Vulkan1 Device (--device Vulkan1)
+            </label>
+
+            <div id="mmproj-section" style="{{mmproj_visibility}}">
+                <label for="mmproj">Multimodal Projection File (from {{model_dir}})</label>
+                <select name="mmproj" id="mmproj">
+                    {{mmproj_options}}
+                </select>
+            </div>
+
+            <label for="rpc_eps">RPC Endpoints (comma-separated host:port)</label>
+            <input type="text" name="rpc_eps" id="rpc_eps" value="{{rpc_eps}}" style="width:100%;max-width:500px;display:block;">
+
+            <div style="margin-top:10px;">
+                <button type="submit">Update & Restart</button>
+            </div>
         </form>
         <p class="{{msg_type}}">{{msg}}</p>
     </div>
 
     <script>
+        const mmCb = document.querySelector('input[name="multimodal"]');
+        const mmSec = document.getElementById('mmproj-section');
+        if (mmCb && mmSec) {
+            mmCb.addEventListener('change', function() {
+                mmSec.style.display = this.checked ? 'block' : 'none';
+            });
+        }
+
         document.querySelector('form[action="refresh_status"]').addEventListener('submit', function(e) {
             e.preventDefault();
             
@@ -251,7 +371,11 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         action = form.get("action", [None])[0]
         threads = 6
         context = 60000
+        gpu_layers = -1
         rpc = False
+        multimodal = False
+        mmproj = ""
+        rpc_eps = rpcEPS
         try:
             if "threads" in form:
                 threads = int(form["threads"][0])
@@ -262,7 +386,21 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 context = int(form["context"][0])
         except:
             pass
+        try:
+            if "gpu_layers" in form:
+                gpu_layers = int(form["gpu_layers"][0])
+        except:
+            pass
         rpc = "rpc" in form
+        multimodal = "multimodal" in form
+        disable_thinking = "disable_thinking" in form
+        cache_type_k = "cache_type_k" in form
+        cache_type_v = "cache_type_v" in form
+        vulkan = "vulkan" in form
+        if "mmproj" in form and form["mmproj"][0]:
+            mmproj = form["mmproj"][0].strip()
+        if "rpc_eps" in form and form["rpc_eps"][0].strip():
+            rpc_eps = form["rpc_eps"][0].strip()
 
         # Default to current model if none selected (only for GET)
         if not is_post or not model:
@@ -271,7 +409,15 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 model = cfg["model"]
                 threads = cfg.get("threads", 6)
                 context = cfg.get("context", 60000)
+                gpu_layers = cfg.get("gpu_layers", -1)
                 rpc = cfg.get("rpc", False)
+                multimodal = cfg.get("multimodal", False)
+                mmproj = cfg.get("mmproj", "")
+                rpc_eps = cfg.get("rpc_eps", rpcEPS)
+                disable_thinking = cfg.get("disable_thinking", False)
+                cache_type_k = cfg.get("cache_type_k", True)
+                cache_type_v = cfg.get("cache_type_v", True)
+                vulkan = cfg.get("vulkan", False)
 
         # Handle service actions
         status_msg = ""
@@ -301,7 +447,15 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 "model": model or "",
                 "threads": threads,
                 "context": context,
-                "rpc": rpc
+                "gpu_layers": gpu_layers,
+                "rpc": rpc,
+                "multimodal": multimodal,
+                "mmproj": mmproj,
+                "rpc_eps": rpc_eps,
+                "disable_thinking": disable_thinking,
+                "cache_type_k": cache_type_k,
+                "cache_type_v": cache_type_v,
+                "vulkan": vulkan
             })
             if ok:
                 status_msg = "✅ " + msg
@@ -321,6 +475,11 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         models = list_models()
         models_options = "".join([f'<option value="{m}" {"selected" if m == model else ""}>{m}</option>' for m in models]) or '<option value="">No .gguf files found</option>'
 
+        mmproj_files = list_mmproj_files()
+        default_mmproj = mmproj if mmproj in mmproj_files else (mmproj_files[0] if mmproj_files else "")
+        mmproj_options = "".join(f'<option value="{m}" {"selected" if m == default_mmproj else ""}>{m}</option>' for m in mmproj_files) or '<option value="">No projection files found</option>'
+        mmproj_visibility = "block" if multimodal else "none"
+
         # Render HTML with full form
         html = HTML.replace("{{status_ok}}", "✅ Yes" if svc_ok else "❌ No")
         html = html.replace("{{current_config}}", cfg_str.replace("<", "&lt;"))
@@ -331,7 +490,16 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         html = html.replace("{{models_options}}", models_options)
         html = html.replace("{{threads}}", str(threads))
         html = html.replace("{{context}}", str(context))
+        html = html.replace("{{gpu_layers}}", str(gpu_layers))
         html = html.replace("{{rpc_checked}}", "checked" if rpc else "")
+        html = html.replace("{{multimodal_checked}}", "checked" if multimodal else "")
+        html = html.replace("{{mmproj_options}}", mmproj_options)
+        html = html.replace("{{mmproj_visibility}}", mmproj_visibility)
+        html = html.replace("{{rpc_eps}}", rpc_eps.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+        html = html.replace("{{disable_thinking_checked}}", "checked" if disable_thinking else "")
+        html = html.replace("{{cache_type_k_checked}}", "checked" if cache_type_k else "")
+        html = html.replace("{{cache_type_v_checked}}", "checked" if cache_type_v else "")
+        html = html.replace("{{vulkan_checked}}", "checked" if vulkan else "")
 
         self.send_response(200)
         self.send_header("Content-type", "text/html; charset=utf-8")
@@ -346,4 +514,3 @@ with socketserver.TCPServer(("", PORT), Handler) as httpd:
     except KeyboardInterrupt:
         print("\n🛑 Stopping server")
         httpd.shutdown()
-
